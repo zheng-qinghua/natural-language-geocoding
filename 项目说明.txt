@@ -1,0 +1,298 @@
+================================================================================
+         自然语言地理编码工具 (Natural Language Geocoding) — 项目文档 v5
+================================================================================
+
+## 一、项目概述
+
+将非结构化的自然语言地点描述转化为结构化的地理空间数据，实现自然语言→地理几何的映射。
+
+示例输入 → 输出：
+  "深圳大学西南方向的公园" → 荔香公园的精准几何多边形 + 交互地图
+  "成都春熙路往南500米"   → 春熙路南侧500米区域 + 交互地图
+  "四川和云南的交界处"     → 川滇交界区域多边形 + 交互地图
+
+核心特点：
+  - 使用 DeepSeek 国内大模型 API，无需 VPN，国内网络环境直接可用。
+  - 可选集成高德地图 API，获取精确 GCJ-02 坐标替代 LLM 近似坐标。
+  - LLM 直接提供地名坐标（无高德Key时），绕开被墙的 Nominatim/OpenStreetMap。
+  - 支持11种空间操作 + 复合方向自动分解。
+  - Tkinter GUI + CLI 双模式。
+  - 打包为独立 .exe 文件。
+
+================================================================================
+## 二、核心架构
+
+  用户输入自然语言
+      │
+      ▼
+  DeepSeekClient ──→ 发送系统提示词 + 用户文本 → 返回JSON空间节点树
+      │
+      ▼
+  PlaceLookup (对齐源项目架构) ──→ 为每个NamedPlace获取真实多边形边界
+      │              ├─ 高德 District API → 中国行政区域真实多边形
+      │              ├─ OSM Overpass API → 全球POI多边形数据
+      │              └─ 高德 Geocoding API → 坐标+扰动多边形（后备）
+      │
+      ▼
+  GeometryBuilder ──→ 递归构建 Shapely 几何对象
+      │              NamedPlace → 仅使用 PlaceLookup 提供的真实多边形
+      │              Buffer → 缓冲区
+      │              DirectionalConstraint → 紧凑方向约束(默认3km)
+      │              Intersection → 交集(含微小容差)
+      │              Union → 并集
+      │              Difference → 差集
+      │              Between → 两点间区域
+      │              BorderBetween → 边界带
+      │              BorderOf → 边界线
+      │              CoastOf → 海岸线
+      │              OffTheCoastOf → 离岸海域
+      │
+      ▼
+  输出层 ──→ Folium交互地图(globalMap.html) + GeoJSON + GUI预览
+
+================================================================================
+## 三、文件结构
+
+```
+Geocoding/
+├── prompts.py          # 系统提示词（9规则块 + 12个完整示例）
+├── geocoding.py        # 核心引擎（LLM客户端 + PlaceLookup + 几何构建器）
+├── osm_place_lookup.py # OSM多边形查找（Overpass API + 高德District API）
+├── amap_geocoder.py    # 高德地图客户端（地理编码 + 行政区划多边形）
+├── main.py             # 程序入口（CLI + Tkinter GUI + Folium地图）
+├── build_exe.py        # PyInstaller打包脚本
+├── config.json         # API Key 配置文件（持久化存储）
+├── natural_earth.py    # 海岸线数据模块
+├── ne_10m_coastline.json # Natural Earth 海岸线数据
+├── globalMap.html      # 生成的地图（运行后）
+├── output.geojson      # 生成的GeoJSON（运行后）
+├── 项目说明.txt         # 本文档
+└── dist/
+    └── GeocodingTool.exe  # 打包好的可执行文件
+```
+
+### 3.1 prompts.py — 提示词模块
+
+9个规则块覆盖了从地名识别、方向分解、坐标精度到输出格式的全部约束：
+
+  规则1 RULE_PLACE_IDENTIFICATION（最重要）：
+    当查询提到具体设施类型（公园/地铁站/商场/酒店等），利用地理知识直接识别
+    并输出具体地点名称。例如 "深圳大学西南方向的公园" → "荔香公园"。
+
+  规则2 RULE_EXTRACT_TARGET（v4新增）：
+    描述性位置短语（"XX与YY围成的ZZ"、"XX里面的YY"）应直接输出目标地物ZZ，
+    不要用 Intersection/Buffer 模拟。例如 "人才星光桥与内地围成的深圳湾内湖" → NamedPlace("深圳人才公园内湖")。
+
+  规则3 RULE_DIRECTION_LIMIT：
+    DirectionalConstraint 必须包含 max_distance_km。城市内默认3km。
+
+  规则4 RULE_SPATIAL_OPS：六种空间操作的使用说明。
+
+  规则5 RULE_INTERCARDINAL：
+    复合方向（西南/东北等）必须分解为 Intersection(南,西)。
+
+  规则6 RULE_BOUNDS_PRECISION：
+    小型地点bounds≤0.03度，省份/国家必须提供bounds，不确定时用center+radius。
+
+  规则7 RULE_HIERARCHY：地名、国家、大陆分字段填写。
+
+  规则8 RULE_SIMPLIFY：优先用最简单结构。
+
+7个JSON示例覆盖了：简单地点、设施识别、复合方向、缓冲区、省份交界、描述性位置、多条件。
+
+### 3.2 geocoding.py — 核心引擎
+
+三个核心类：
+
+  DeepSeekClient:
+    - OpenAI兼容接口 → api.deepseek.com
+    - 低temperature(0.1)确保稳定输出
+
+  GeometryBuilder（递归几何构建器）：
+    - _build_named_place: 三级退化策略
+      1) bounds合理(跨度<50度) → 直接用矩形
+      2) bounds过大(>50度) → 回退到center+radius
+      3) 仅center → 回退到Point(默认半径500m)
+      如果有高德精确数据，使用高德精度等级对应的半径（POI:150m, 门牌号:100m）
+
+    - _build_directional: 紧凑方向约束
+      延伸方向限制在 max_distance_km（默认3km），垂直方向仅覆盖子几何自身范围。
+      对 Intersection(north, west) 等复合方向产生紧凑的角落矩形。
+
+    - _build_intersection: 带微容差的交集
+      0.005度（≈500m）缓冲区确保相邻区域可产生交集，
+      适用于城市级和省级场景。
+
+    - _build_union / _build_between / _build_buffer
+
+  NaturalLanguageGeocoder（顶层协调器）：
+    四层精度保障：
+      层1 - LLM语义解析：DeepSeek将自然语言转换为空间节点树
+      层2 - 高德地理编码：用高德API查询每个NamedPlace的精确坐标（需API Key）
+      层3 - 空间几何算法：Shapely执行Buffer/Intersection/Union等运算
+      层4 - 合理性校验：bounds跨度检查、默认半径约束
+    geocode(text) → Shapely几何对象
+    geocode_to_geojson(text) → GeoJSON字符串
+
+### 3.3 amap_geocoder.py — 高德地图集成（可选）
+
+  AmapGeocoder:
+    - 高德Web API地理编码：地名→GCJ-02精确坐标
+    - 精度等级映射：兴趣点→150m, 门牌号→100m, 村庄→500m, 乡镇→2km, 区县→5km
+    - LRU缓存(500条)减少重复API调用
+    - 多策略城市限定：in_region → in_country → 无限制
+    - 免费额度：5000次/天
+
+  启用方式：
+    1. 访问 https://lbs.amap.com 注册获取Web服务API Key
+    2. 设置环境变量: set AMAP_API_KEY=your_key
+    3. 程序自动启用高德精确坐标
+
+### 3.4 main.py — 程序入口
+
+  三种运行模式：
+    python main.py                  → Tkinter GUI
+    python main.py --cli "查询"      → 命令行
+    python main.py "查询1" "查询2"   → 直接文本
+
+  输出路径处理：
+    开发环境: 文件保存在 main.py 所在目录
+    exe环境:  文件保存在 .exe 所在目录（使用 sys.frozen 检测）
+
+  create_map(): Folium地图生成，点/面两种渲染方式。
+
+### 3.5 build_exe.py — 打包脚本
+
+  PyInstaller --onefile 打包，输出 dist/GeocodingTool.exe (~115MB)。
+
+================================================================================
+## 四、关键优化历史
+
+v6 (当前版本):
+  - 重构：对齐源项目 PlaceLookup 架构，NamedPlace 100% 使用真实多边形
+  - 新增：osm_place_lookup.py — OSM Overpass API 多边形查询 + 高德 District API 集成
+  - 新增：_get_region_adcode() — adcode前缀匹配解决同名行政区歧义
+    （如"南山区"在鹤岗和深圳各有同名，通过 in_region 自动选择正确的深圳南山区）
+  - 删除：_build_named_place 不再生成矩形(box)或圆形(.buffer)
+  - 新增：main.py 读取 config.json 持久化API Key（无需每次设置环境变量）
+  - 数据源优先级：高德 District API → OSM Overpass API → 高德 Geocoding API 坐标
+
+v5:
+  - 新增：高德行政区划API集成，NamedPlace 支持真实多边形边界（替代纯矩形/圆形）
+    （如"四川和云南的交界处"：从矩形交集→两省真实多边形边界交集，35147个坐标点）
+  - 新增：AmapGeocoder.get_district_polygon() 方法，调用高德 District API 获取行政区域边界
+  - 更新：_build_named_place 新增第一优先级：高德多边形 → bounds矩形 → center+radius圆
+  - 新增：11种空间操作全部实现（Difference, BorderBetween, BorderOf, CoastOf, OffTheCoastOf）
+  - 新增：natural_earth.py 海岸线数据模块（CoastOf/OffTheCoastOf 依赖）
+
+v4:
+  - 新增：高德地图 API 集成（AmapGeocoder），可选启用精确 GCJ-02 坐标
+  - 新增：RULE_EXTRACT_TARGET 规则，防止 LLM 用 Intersection 模拟描述性位置
+    （如"人才星光桥与内地围成的深圳湾内湖"→直接输出 NamedPlace，从7km缩至0.45km）
+  - 优化：DirectionalConstraint 垂直方向不再额外扩展，Intersection(north,west) 从13km缩至1km
+  - 优化：Intersection 容差从0.03°缩至0.005°，城市级交集不再膨胀
+  - 优化：默认方向距离从10km降至3km，默认半径从1km降至0.5km
+  - 新增：amap_geocoder.py 模块（高德地理编码）
+
+v3:
+  - 修复：复合方向分解后区域覆盖半个地球 → DirectionalConstraint加max_distance_km
+  - 修复：深圳大学bounds过大 → 改进提示词(0.03度限制) + 提示LLM识别具体地点
+  - 修复：四川云南交界为空 → bounds阈值从1度改为50度 + Intersection加缓冲容差
+  - 修复：exe版本文件保存到临时目录 → sys.frozen检测改用exe所在目录
+
+v2:
+  - 新增复合方向分解规则(GUIDELINE_INTERCARDINAL)
+  - 三级bounds退化策略
+  - 方向约束全球范围修复
+
+v1:
+  - 基础功能实现（NamedPlace/Buffer/Directional/Intersection/Union/Between）
+  - Tkinter GUI + CLI
+  - PyInstaller打包
+
+================================================================================
+## 五、使用方式
+
+  命令行:
+    python main.py --cli "深圳大学西南方向的公园"
+
+  图形界面:
+    python main.py --gui
+
+  打包:
+    python build_exe.py
+    ./dist/GeocodingTool.exe
+
+================================================================================
+## 六、依赖
+
+  openai >= 1.0     # DeepSeek API (国内直连)
+  shapely >= 2.0    # 地理几何计算
+  folium >= 0.17    # 交互地图
+  pyinstaller >= 6  # 打包 (仅打包时需要)
+
+================================================================================
+## 七、局限性
+
+1. 无高德API Key时坐标精度依赖LLM地理知识（默认半径500m的圆形区域）
+2. 公里→度数转换使用球面近似，极地地区误差大
+3. CoastOf/OffTheCoastOf 需要 Natural Earth 海岸线数据文件（首次自动下载）
+4. 行政区划多边形边界仅对省/市/区县有效，POI（公园/大学/商场）仍使用圆形近似
+5. 高德行政区划API返回GCJ-02坐标系的复杂多边形，顶点数可能达数万
+
+## 八、v4 高德API精度对比（AMAP_API_KEY=fa9bb...）
+
+  输入                    | 无高德(km²) | 有高德(km²) | 提升
+  -----------------------|-----------|-----------|------
+  天安门广场               | 1.359     | 0.117     | 11.6x ↑
+  杭州西湖                 | 26.761    | 0.104     | 256.9x ↑
+  深圳人才公园             | 0.733     | 0.097     | 7.5x ↑
+  荔香公园                 | 0.733     | 0.097     | 7.5x ↑
+  深圳大学                 | 1.145     | 1.083     | 1.1x ≈
+  天安门东站               | 0.152     | 0.117     | 1.3x ≈
+  春熙路                   | 0.384     | 1.162     | 0.3x ↓*
+  上海外滩                 | 1.060     | 1.170     | 0.9x ≈
+  天安门西北方向           | 0.950     | 0.951     | 1.0x ≈
+  上海外滩附近3公里         | 56.523    | 57.195    | 1.0x ≈
+
+  *春熙路：LLM给出的bounds异常紧凑(0.384km²)，高德返回道路级精度(500m半径)。
+   对于此类线性地物，高德更保守的估计可能更合理。
+
+  POI级（兴趣点/门牌号）平均面积缩小 70.9x。
+  高德API将位置精度从LLM的~500m提升至150m（POI级）到100m（门牌号级）。
+
+  启用方式：
+    1. 访问 https://lbs.amap.com 注册获取Web服务API Key（免费5000次/天）
+    2. export AMAP_API_KEY=your_key  （Linux/Mac）
+       set AMAP_API_KEY=your_key     （Windows cmd）
+    3. 程序自动启用高德精确坐标
+
+## 九、v4精度基准测试（无高德Key时）
+
+  输入                                          | 跨度          | 评价
+  ---------------------------------------------|--------------|------
+  深圳市人才公园中人才星光桥与内地围成的深圳湾内湖   | 0.45km×0.41km | 精确（修复前7km）
+  深圳大学西南方向的公园                         | 0.89km×0.82km | 精确
+  深圳大学                                      | 1.11km×1.03km | 合理
+  天安门广场西北方向                             | 1.11km×0.85km | 精确（修复前13km）
+  北京故宫东边的地铁站                           | 0.45km×0.34km | 精确
+  上海外滩附近3公里                              | 8.13km×6.95km | 符合预期
+  四川和云南的交界处                             | 368km×859km   | 合理
+
+## 十、v5 行政区划多边形精度（新增，需高德Key）
+
+  高德行政区划API (v3/config/district) 提供省/市/区县的真实多边形边界：
+
+  输入                    | v4矩形方案(km²) | v5多边形方案(km²) | 实际面积(km²)
+  -----------------------|---------------|----------------|-------------
+  深圳市                   | ~2600 (圆形)   | 2,148          | ~2,050
+  广东省                   | ~180,000 (矩形)| 183,109        | ~179,800
+  四川和云南的交界处        | 368km×859km   | 1,960          | 真实边界交集
+
+  行政区划多边形边界详细程度：
+  - 深圳市：MultiPolygon，6个环，约8万个坐标点
+  - 广东省：MultiPolygon，真实海岸线边界
+  - 川滇交界：Polygon，~35,147个坐标点，精确跟踪省界
+
+  注意：多边形仅适用于行政区划（省/市/区县），POI（公园/大学/商场）仍使用
+  高德地理编码API的精确中心坐标+半径。

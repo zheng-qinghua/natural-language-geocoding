@@ -1,0 +1,22 @@
+# Runtime outputs
+globalMap.html
+output.geojson
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build_temp/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.exe
+__pycache__/
+*.pyc
