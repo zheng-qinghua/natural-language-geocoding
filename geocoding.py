@@ -66,7 +66,7 @@ class DeepSeekClient:
         """
         self.api_key = api_key or os.getenv(
             "DASHSCOPE_API_KEY",
-            "sk-a62bd759c3db42adb4c8ae7c9d2943a6"
+            "sk-xxx"
         )
         self.client = OpenAI(
             api_key=self.api_key,
