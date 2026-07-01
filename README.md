@@ -5,6 +5,11 @@
 > 将“人类语言描述的位置”自动转换为**真实地理区域 + 可视化地图**
 
 ---
+## 运行演示
+<img width="2559" height="1439" alt="image" src="https://github.com/user-attachments/assets/b2988226-a621-4546-b854-0d04fcde8b2e" />
+<img width="2559" height="1439" alt="屏幕截图 2026-07-01 190201" src="https://github.com/user-attachments/assets/4fc1306d-e437-4eb9-877c-11dd3c7ef2c1" />
+
+---
 
 ## 🚀 项目亮点
 
@@ -243,7 +248,6 @@ python main.py --gui
 * 可视化工程实现
 
 ---
-<img width="2559" height="1439" alt="image" src="https://github.com/user-attachments/assets/b2988226-a621-4546-b854-0d04fcde8b2e" />
-<img width="2559" height="1439" alt="屏幕截图 2026-07-01 190201" src="https://github.com/user-attachments/assets/4fc1306d-e437-4eb9-877c-11dd3c7ef2c1" />
+
 
 
