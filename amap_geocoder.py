@@ -4,6 +4,9 @@
 高德地图 API 是国内最常用的地图服务之一，无需 VPN，免费注册即可使用。
 免费额度：5000次/天 地理编码请求。
 
+高德返回 GCJ-02（国测局）坐标，本模块在出口处统一转换为 WGS-84（见
+coord_transform.py），使调用方只需处理单一坐标系。
+
 注册流程：
   1. 访问 https://lbs.amap.com 注册账号
   2. 进入"应用管理 → 我的应用"创建应用
@@ -17,16 +20,79 @@
 """
 
 import requests
-import time
+from difflib import SequenceMatcher
 from functools import lru_cache
+import math
+from collections.abc import Sequence
+
+from coord_transform import gcj02_to_wgs84, transform_geojson
+# 中英映射与别名扩展与其它数据源共用一套表（见 place_lookup）。
+# 这里不再自己维护 EN_TO_CN：各写一份的后果是改一处漏一处，
+# 而且高德侧漏掉的名字会表现为"这个地名突然查不到了"。
+from place_lookup import GEO_EN_TO_CN, expand_name_variants, has_latin
+
+
+# 中文名与返回地址的部分匹配门槛：
+#   - 绝对下限：至少 2 个字重合（1 个字等于不设门槛）
+#   - 相对下限：重合字数要覆盖名字的 3/4，防止只认住一半就放行
+# 两个都要满足。相对下限是一步步收紧来的：
+#   只有绝对下限 2 → 实测查"火星大裂谷"时，高德返回了一个地址里含"火星"
+#     （山东某地，与火星无关）的村庄，两个字重合就放行了，于是"火星上的大裂谷"
+#     变成了山东境内的一个点。改成覆盖 2/3（对 5 字名要求 4 字）。
+#   2/3 对 3 字名只要求 2 字 → 查"清华园"时返回"清华大学"会因"清华"两字通过，
+#     而这是相邻的两个不同地方。提到 3/4 后 3 字名要求 3 字，正好堵住；
+#     受影响的只有 3 字名（2→3）、6 字名（4→5）、7 字名（5→6），
+#     "上海外滩"（4 字全中"上海市浦东新区外滩"）这类拆开写的情况照常通过。
+_MIN_CJK_NAME_OVERLAP = 2
+_MIN_CJK_NAME_COVERAGE = 3 / 4
+
+
+def _name_evidence(name_forms: Sequence[str], address: str) -> str | None:
+    """在返回地址里找名字证据，命中则返回命中的那个名字，否则返回 None。
+
+    为什么需要这道门槛：高德地理编码对查不到的名字不会返回空，而是做模糊匹配，
+    悄悄丢掉不认识的那部分（实测 "Nowhereland University" → 福建省厦门市同安区
+    "大学"，落到一个凭空出现的村庄上）。调用方据此降级成的中心点看似正常，
+    实际是错地点，而错地点正是这类系统最难排查的问题。宁可判为查不到。
+
+    判定分两档：
+      - 名字整体出现在地址里（西文按小写比，中文直接比）
+      - 中文名与地址的重合字数达标（应对地址把名字拆开写的情况，见上面两个门槛）
+
+    西文名不做这档部分匹配：高德对西文查询做的是转写/模糊匹配，地址里写的是
+    中文，字面重合的两个字符不代表同一个地方。西文名靠 expand_name_variants
+    先换成中文变体再来命中（"Shenzhen University" 会带出"深圳大学"）。
+    """
+    if not address:
+        return None
+    lowered = address.lower()
+    for form in name_forms:
+        if not form:
+            continue
+        if form.lower() in lowered:
+            return form
+        if has_latin(form):
+            continue
+        # 统计所有匹配片段的总字数，而不是只看最长的一段：
+        # "上海外滩" 对 "上海市浦东新区外滩" 是两个各自两字的片段，总覆盖 4/4。
+        # 单字的片段一律不计：地址里的通名（"站""村""路"）太容易撞上，
+        # 实测查"深圳北站"时靠地址尾巴"(公交站)"的"站"凑够数，就放行了深圳大学。
+        matched = sum(block.size for block in
+                      SequenceMatcher(None, form, address,
+                                      autojunk=False).get_matching_blocks()
+                      if block.size >= _MIN_CJK_NAME_OVERLAP)
+        needed = max(_MIN_CJK_NAME_OVERLAP, math.ceil(len(form) * _MIN_CJK_NAME_COVERAGE))
+        if matched >= needed:
+            return form
+    return None
 
 
 class AmapGeocoder:
     """
     高德地图地理编码封装。
 
-    使用高德 Web API 将地名（中文）转换为精确的 GCJ-02 坐标。
-    GCJ-02 是中国国测局坐标系，在中国地图上显示更准确。
+    使用高德 Web API 将地名（中文）解析为精确坐标。高德返回 GCJ-02，
+    本类在出口处统一转换为 WGS-84，调用方拿到的始终是 WGS-84 坐标。
     """
 
     # 高德地理编码 API 地址
@@ -100,7 +166,7 @@ class AmapGeocoder:
 
         Returns:
             {"lng": 经度, "lat": 纬度, "level": 精度等级, "address": 完整地址}
-            失败返回 None
+            经纬度为 WGS-84。失败返回 None
         """
         params = {
             "key": self.api_key,
@@ -116,11 +182,13 @@ class AmapGeocoder:
 
             if data.get("status") == "1" and data.get("geocodes"):
                 geo = data["geocodes"][0]
-                lng, lat = geo["location"].split(",")
+                raw_lng, raw_lat = geo["location"].split(",")
+                # 高德返回 GCJ-02，统一转换为 WGS-84 后再交给调用方
+                lng, lat = gcj02_to_wgs84(float(raw_lng), float(raw_lat))
                 level = geo.get("level", "兴趣点")
                 return {
-                    "lng": float(lng),
-                    "lat": float(lat),
+                    "lng": lng,
+                    "lat": lat,
                     "level": level,
                     "address": geo.get("formatted_address", address),
                     "suggested_radius_km": self.LEVEL_RADIUS_MAP.get(level, 0.5),
@@ -130,48 +198,15 @@ class AmapGeocoder:
         except Exception:
             return None
 
-    # 英文省名 → 中文省名映射（用于高德API城市限定）
-    EN_TO_CN = {
-        "beijing": "北京", "Beijing": "北京",
-        "shanghai": "上海", "Shanghai": "上海",
-        "guangdong": "广东", "Guangdong": "广东",
-        "zhejiang": "浙江", "Zhejiang": "浙江",
-        "sichuan": "四川", "Sichuan": "四川",
-        "jiangsu": "江苏", "Jiangsu": "江苏",
-        "hubei": "湖北", "Hubei": "湖北",
-        "hunan": "湖南", "Hunan": "湖南",
-        "fujian": "福建", "Fujian": "福建",
-        "shandong": "山东", "Shandong": "山东",
-        "henan": "河南", "Henan": "河南",
-        "hebei": "河北", "Hebei": "河北",
-        "liaoning": "辽宁", "Liaoning": "辽宁",
-        "yunnan": "云南", "Yunnan": "云南",
-        "guizhou": "贵州", "Guizhou": "贵州",
-        "shanxi": "山西", "Shanxi": "山西",
-        "shaanxi": "陕西", "Shaanxi": "陕西",
-        "gansu": "甘肃", "Gansu": "甘肃",
-        "qinghai": "青海", "Qinghai": "青海",
-        "hainan": "海南", "Hainan": "海南",
-        "jilin": "吉林", "Jilin": "吉林",
-        "anhui": "安徽", "Anhui": "安徽",
-        "jiangxi": "江西", "Jiangxi": "江西",
-        "taiwan": "台湾", "Taiwan": "台湾",
-        "guangxi": "广西", "Guangxi": "广西",
-        "neimenggu": "内蒙古", "Inner Mongolia": "内蒙古",
-        "xinjiang": "新疆", "Xinjiang": "新疆",
-        "xizang": "西藏", "Tibet": "西藏",
-        "ningxia": "宁夏", "Ningxia": "宁夏",
-        "hong kong": "香港", "Hong Kong": "香港",
-        "macau": "澳门", "Macau": "澳门",
-        "china": "中国", "China": "中国",
-        "asia": "亚洲",
-    }
+    # 英文名 → 中文名映射（用于高德 API 的城市限定）；表本身在 place_lookup，
+    # 键统一为小写，查表方负责 lower()。
+    EN_TO_CN = GEO_EN_TO_CN
 
     def _to_cn_city(self, name: str) -> str | None:
         """将英文地名转换为中文城市名（用于高德API限定）。"""
         if not name:
             return None
-        return self.EN_TO_CN.get(name) or self.EN_TO_CN.get(name.lower(), None)
+        return self.EN_TO_CN.get(name.lower()) or None
 
     def _validate_result(self, result: dict, in_region: str = None, in_country: str = None) -> bool:
         """校验高德返回的地址是否在预期的区域内。"""
@@ -208,6 +243,10 @@ class AmapGeocoder:
         多策略查询，收集所有有效结果后选择精度最高的那个。
         对返回结果进行地址校验，过滤掉不在预期区域的结果。
 
+        地名及其别名变体（见 place_lookup.expand_name_variants，"Shenzhen
+        University" 与 "深圳大学" 互为变体）都走一遍策略：高德的 POI 库里
+        通常只存中文名，只拿英文原名去查往往一个结果都没有。
+
         Args:
             name: 地名
             in_region: 所在省份/州（来自 LLM 解析，可能为英文如"Guangdong"）
@@ -219,45 +258,60 @@ class AmapGeocoder:
         cn_region = self._to_cn_city(in_region)
         cn_country = self._to_cn_city(in_country)
         candidates = []  # (result, level_score)
+        # 名字的全部等价写法（含中英互转），用来在返回地址里找名字证据。
+        # 一次算好、闭包固定引用：早先按循环变量 variant 判断会随迭代变化，
+        # 而证据只需要"这个名字族里任一写法出现过"即可。
+        variant_forms = expand_name_variants(name)
 
         def _try_add(result):
-            if result and self._validate_result(result, in_region, in_country):
-                candidates.append((result, self._level_score(result.get("level", ""))))
+            if not result or not self._validate_result(result, in_region, in_country):
+                return
+            address = result.get("address", "")
+            if _name_evidence(variant_forms, address) is None:
+                print(
+                    f"[高德] 丢弃「{name}」的无名证据结果："
+                    f"addr='{address}' level={result.get('level', '')}"
+                )
+                return
+            candidates.append((result, self._level_score(result.get("level", ""))))
 
-        # 策略1：中文省/城市限定
-        if cn_region:
-            _try_add(self.geocode(name, city=cn_region))
+        for variant in variant_forms:
+            # 策略1：中文省/城市限定
+            if cn_region:
+                _try_add(self.geocode(variant, city=cn_region))
 
-        # 策略2：中文国家限定
-        if cn_country:
-            _try_add(self.geocode(name, city=cn_country))
+            # 策略2：中文国家限定
+            if cn_country:
+                _try_add(self.geocode(variant, city=cn_country))
 
-        # 策略3：英文省名
-        if in_region and in_region != cn_region:
-            _try_add(self.geocode(name, city=in_region))
+            # 策略3：英文省名
+            if in_region and in_region != cn_region:
+                _try_add(self.geocode(variant, city=in_region))
 
-        # 策略4：英文国家名
-        if in_country and in_country != cn_country:
-            _try_add(self.geocode(name, city=in_country))
+            # 策略4：英文国家名
+            if in_country and in_country != cn_country:
+                _try_add(self.geocode(variant, city=in_country))
 
-        # 策略5：无城市限定
-        _try_add(self.geocode(name))
+            # 策略5：无城市限定
+            _try_add(self.geocode(variant))
 
-        # 策略6：地名+省份拼接
-        if cn_region and cn_region not in name:
-            _try_add(self.geocode(cn_region + name))
+            # 策略6：地名+省份拼接
+            if cn_region and cn_region not in variant:
+                _try_add(self.geocode(cn_region + variant))
 
-        # 策略7：地名+国家拼接
-        if cn_country and cn_country not in name:
-            _try_add(self.geocode(cn_country + name))
+            # 策略7：地名+国家拼接
+            if cn_country and cn_country not in variant:
+                _try_add(self.geocode(cn_country + variant))
 
-        # 策略8：尝试添加具体化后缀（带城市限定更精确）
-        suffixes = ["风景名胜区", "风景区", "景区", "公园", "湖"]
-        for suffix in suffixes:
-            if suffix not in name:
-                if cn_region:
-                    _try_add(self.geocode(name + suffix, city=cn_region))
-                _try_add(self.geocode(name + suffix))
+            # 策略8：尝试添加具体化后缀（带城市限定更精确）。
+            # 只对纯中文变体做：中文后缀拼在西文名后面只会拼出无意义的查询串。
+            if not has_latin(variant):
+                suffixes = ["风景名胜区", "风景区", "景区", "公园", "湖"]
+                for suffix in suffixes:
+                    if suffix not in variant:
+                        if cn_region:
+                            _try_add(self.geocode(variant + suffix, city=cn_region))
+                        _try_add(self.geocode(variant + suffix))
 
         # 选择精度最高的结果
         if candidates:
@@ -285,10 +339,18 @@ class AmapGeocoder:
                 "level": 行政级别,
                 "adcode": 行政区划代码,
             }
-            失败返回 None
+            坐标为 WGS-84（已从高德的 GCJ-02 转换）。失败返回 None
         """
         DISTRICT_URL = "https://restapi.amap.com/v3/config/district"
         candidates = []
+        names = expand_name_variants(name)
+        # 命中"名字完全一致"的候选可优先，别名也要算数：
+        # 查 "Shenzhen" 命中名为"深圳市"的区划时，不能因为字面不同就丢掉这个偏好
+        accepted_names = set(names)
+        for variant in names:
+            cn_variant = self._to_cn_city(variant)
+            if cn_variant:
+                accepted_names.add(cn_variant)
 
         def _try(name_to_try):
             params = {
@@ -302,6 +364,10 @@ class AmapGeocoder:
                 data = resp.json()
                 if data.get("status") == "1" and data.get("districts"):
                     for dist in data["districts"]:
+                        # 与 geocode_place 同一道门槛：区划 API 也会对不认识的名字
+                        # 做模糊匹配返回一个不相干的区划，名字对不上就整条丢掉
+                        if _name_evidence(names, dist.get("name", "")) is None:
+                            continue
                         pl = dist.get("polyline", "")
                         if pl:
                             candidates.append(dist)
@@ -333,29 +399,29 @@ class AmapGeocoder:
         # Try multiple strategies (same pattern as geocode_place)
         cn_region = self._to_cn_city(in_region)
         cn_country = self._to_cn_city(in_country)
-        cn_name = self._to_cn_city(name)
 
-        _try(name)
+        for variant in names:
+            _try(variant)
 
-        # If name is English, try Chinese translation
-        if cn_name and cn_name != name:
-            _try(cn_name)
-            # Also try with suffix on Chinese name
-            for suffix in ["省", "市", "区", "县"]:
-                if suffix not in cn_name:
-                    _try(cn_name + suffix)
+            # 英文名换中文再试一轮（高德区划库里存的是中文名）
+            cn_variant = self._to_cn_city(variant)
+            if cn_variant and cn_variant != variant:
+                _try(cn_variant)
+                for suffix in ["省", "市", "区", "县"]:
+                    if suffix not in cn_variant:
+                        _try(cn_variant + suffix)
 
-        if cn_region and cn_region not in name:
-            _try(cn_region + name)
+            if cn_region and cn_region not in variant:
+                _try(cn_region + variant)
 
-        if cn_country and cn_country not in name:
-            _try(cn_country + name)
+            if cn_country and cn_country not in variant:
+                _try(cn_country + variant)
 
-        # Also try with/without suffix variations for district API
-        suffixes = ["市", "区", "县", "省"]
-        for suffix in suffixes:
-            if suffix not in name:
-                _try(name + suffix)
+            # Also try with/without suffix variations for district API
+            if not has_latin(variant):
+                for suffix in ["市", "区", "县", "省"]:
+                    if suffix not in variant:
+                        _try(variant + suffix)
 
         # Select best result: filter by region adcode, then by level priority
         if candidates:
@@ -378,7 +444,7 @@ class AmapGeocoder:
                         filtered = region_matches
 
             # Prefer exact name match
-            exact = [d for d in filtered if d.get("name") == name or d.get("name") == cn_name]
+            exact = [d for d in filtered if d.get("name") in accepted_names]
             if exact:
                 filtered = exact
 
@@ -389,8 +455,9 @@ class AmapGeocoder:
             dist = filtered[0]
             coords = _polyline_to_coords(dist["polyline"])
             if coords:
+                # 高德 polyline 是 GCJ-02，统一转换为 WGS-84 后再返回
                 return {
-                    **coords,
+                    **transform_geojson(coords),
                     "level": dist.get("level", ""),
                     "adcode": dist.get("adcode", ""),
                     "name": dist.get("name", name),
@@ -417,7 +484,7 @@ class AmapGeocoder:
                 "level": 精度等级,
                 "address": 完整地址
             }
-            失败返回 None
+            经纬度为 WGS-84。失败返回 None
         """
         result = self.geocode_place(name, in_region, in_country)
         if result is None:

@@ -26,6 +26,15 @@ else:
 _COASTLINE_FILE = os.path.join(_DATA_DIR, "ne_10m_coastline.json")
 
 
+def coastline_file_path() -> str:
+    """海岸线数据文件的实际路径。
+
+    供 `nlgeocoding init` 等外部调用方使用：路径判断（打包/开发两种环境）
+    只在这里做一次，避免各处重复推导出不一致的位置。
+    """
+    return _COASTLINE_FILE
+
+
 def download_coastline_file():
     """下载 Natural Earth 海岸线 GeoJSON 数据。"""
     import urllib.request

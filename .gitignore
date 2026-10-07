@@ -1,22 +1,46 @@
-# Runtime outputs
-globalMap.html
-output.geojson
+# ── 本地配置（含 API Key，绝不提交）──────────────────────
+config.json
 
-# Python
+# ── 运行时产物 ──────────────────────────────────────────
+output.geojson
+output_batch.geojson
+globalMap.html
+perf_cold.json
+perf_warm.json
+
+# ── 缓存 ────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-
-# PyInstaller
+_osm_cache/
+_event_cache/
+endpoints.json
 build_temp/
+
+# ── 打包产物 ────────────────────────────────────────────
 *.spec
-
-# IDE
-.vscode/
-.idea/
-
-# Environment
-.env
 *.exe
-__pycache__/
-*.pyc
+
+# ── IDE ─────────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── 开发/调试脚本、日志、性能报告（本地保留，不上传）─────
+__*.py
+__*.txt
+__*.log
+_*.log
+_*.txt
+perf_profile.py
+
+# ── 本地文档与测试数据（不上传）─────────────────────────
+开发规划.md
+项目说明.txt
+项目开发日志.txt
+项目开发记录.md
+测试用例.txt
+测试用例_异常.txt
+*.png
+
+# ── 环境 ────────────────────────────────────────────────
+.env

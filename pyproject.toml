@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nlgeocoding"
+version = "0.1.0"
+description = "自然语言地理编码：把中文/英文地点描述转换为真实边界的 Shapely 几何"
+# 代码里大量使用 `str | None` 这类 PEP 604 注解（运行时求值），需要 3.10+
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",     # DeepSeek 走 OpenAI 兼容接口
+    "pydantic>=2.0",   # 节点模型与 LLM 输出校验（models.py）
+    "shapely>=2.0",    # 几何运算
+    "folium>=0.14",    # 地图渲染
+    "requests>=2.28",  # 高德 / OSM Overpass HTTP 调用
+]
+
+[project.optional-dependencies]
+# Web Demo（app.py）用：pip install -e ".[web]" 之后 streamlit run app.py
+web = ["streamlit>=1.28"]
+
+[project.scripts]
+# 安装后可用：nlgeocoding init / nlgeocoding --gui / nlgeocoding --cli "文本"
+nlgeocoding = "main:main"
+
+[tool.setuptools]
+# 扁平布局：模块就放在仓库根目录，不做包目录搬迁。
+# 这样 `python main.py`、PyInstaller 打包（build_exe.py）和 pip 安装三条路径
+# 共用同一套文件，不必维护两份目录结构。
+py-modules = [
+    "main",
+    "geocoding",
+    "models",
+    "prompts",
+    "errors",
+    "place_lookup",
+    "osm_place_lookup",
+    "amap_geocoder",
+    "coord_transform",
+    "geometry_utils",
+    "splitter",
+    "natural_earth",
+    "event_data",
+    "event_aggregate",
+    "candidate_score",
+]
+# build_exe.py 是开发脚本，刻意不在 py-modules 里，不会被装进环境。
+
+# 注：ne_10m_coastline.json（19MB）不作为包数据分发——它属于"运行时数据"，
+# 由 `nlgeocoding init` 检查/下载到 natural_earth.py 所在目录。
+# config.json（API Key）同理，属于用户本地配置，不进分发包。
