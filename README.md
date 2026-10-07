@@ -8,6 +8,7 @@
 ## 运行演示
 <img width="2559" height="1439" alt="image" src="https://github.com/user-attachments/assets/b2988226-a621-4546-b854-0d04fcde8b2e" />
 <img width="2559" height="1439" alt="屏幕截图 2026-07-01 190201" src="https://github.com/user-attachments/assets/4fc1306d-e437-4eb9-877c-11dd3c7ef2c1" />
+<img width="2559" height="1439" alt="距离深圳湾体育中心最近的商场" src="https://github.com/user-attachments/assets/7a0530ad-48bc-4139-a562-88e936e3f2e9" />
 
 ---
 
